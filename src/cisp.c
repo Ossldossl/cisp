@@ -1,0 +1,417 @@
+#include "cisp.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
+
+void cs_error(cs_Context* c, cs_Error error) {
+    c->err = error;
+    if (c == null) return;
+    // calculate line and col
+    u32 index = (u64)c->cur - (u64)c->start;
+    u32 line = 1; u32 col = 1;
+    char* cur = c->start;
+    bool found = false;
+    while (true) {
+        if (*cur == 0) break;
+        if (((u64)cur - (u64)c->start) == index) {
+            found = true;
+            break;
+        }
+        if (*cur == '\r') {
+            cur += 2;
+            line++;
+            col = 1;
+            continue;
+        }
+        if (*cur == '\n') {
+            cur++;
+            line++;
+            col = 1;
+            continue;
+        }
+        col++; cur++;
+    }
+    // TODO: print callstack
+}
+
+/* ==== POOL ALLOCATOR ==== */
+cs_Pool cs_pool_init(u32 element_size)
+{
+    cs_Pool result;
+    result.element_size = element_size;
+    result.mem = malloc(4096);
+    pool_next(result.mem) = null;
+    
+    result.freelist = pool_data(result.mem);
+    char* cur = result.freelist;
+    char* end = (char*)result.mem + 4096;
+    while ((u64)cur < (u64)end) {
+        *(void**)cur = cur + element_size;
+        cur += element_size;
+    }
+    void** last = (void**)(end - element_size);
+    last = null;
+}
+
+void* cs_pool_alloc(cs_Pool* p)
+{
+    void* result = p->freelist;
+    if (p->freelist == null) {
+        // TODO: allocate new bucket
+        cs_error(null, CS_OUT_OF_MEM);
+        exit(-1);
+    }
+    p->freelist = freelist_next(p->freelist);
+    return result;
+}
+
+void cs_pool_free(cs_Pool* p, void** ptr)
+{
+    if ((u64)ptr < (u64)p->freelist) {
+        *ptr = p->freelist;
+        p->freelist = ptr;
+        return;
+    }
+    void** cur = p->freelist;
+    void** last = null;
+    while ((u64)cur < (u64)ptr) {
+        last = cur;
+        cur = freelist_next(cur);
+    }
+    *last = ptr;
+    *ptr = cur;
+    return;
+}
+
+void cs_pool_release(cs_Pool* p) {
+    // TODO: support multiple buckets
+    free(p->mem);
+}
+
+/* ==== STR ==== */
+cs_Str* cs_str_init(u32 len) {   
+    cs_Str* result = malloc(sizeof(cs_Str) + len);
+    result->size = len;
+    return result;
+}
+
+cs_StrBuilder cs_strbuilder_init(u32 cap)
+{
+    cs_StrBuilder result;
+    result.cap = cap;
+    result.len = 0;
+    result.data = malloc(cap);
+    memset(result.data, 0, cap);
+    return result;
+}
+
+void cs_strbuilder_appendc(cs_StrBuilder* b, char c)
+{
+    b->len++;
+    if (b->len > b->cap) {
+        b->cap *= 2;
+        b->data = realloc(b->data, b->cap);
+    }
+    b->data[b->len-1] = c;
+}
+
+void cs_strbuilder_appends(cs_StrBuilder* b, char* c, u32 len)
+{
+    if (len == 0) len = strlen(c);
+    u8* cur = &b->data[len-1];
+    b->len += len;
+    while (b->len > b->cap) {
+        b->cap *= 2;
+    }
+    b->data = realloc(b->data, b->cap);
+
+    memcpy(cur, c, len);
+}
+
+cs_Str* cs_strbuilder_finish(cs_StrBuilder* b)
+{
+    cs_Str* result = cs_str_init(b->len+1);
+    memcpy(cstr(result), b->data, b->len);
+    result->data[b->len] = 0;
+    result->size -= 1; // don't count the zero terminator
+    free(b->data);
+    return result;
+}
+
+/* ==== MAIN ==== */
+#define advance() (c->cur++)
+#define retreat() (c->cur--)
+#define cur() (*c->cur)
+
+cs_Context cs_init() 
+{
+    cs_Context result = {0};
+    result.obj_pool = cs_pool_init(sizeof(cs_Object));
+    return result;
+}
+
+cs_Object* cs_make_object(cs_Context* c) 
+{
+    cs_Object* result = cs_pool_alloc(&c->obj_pool);
+    memset(result, 0, sizeof(cs_Object));
+    return result;
+}
+
+void cs_obj_settype(cs_Object *obj, cs_ObjectType type)
+{
+    obj->car = (void*)(((u64)type << 56) | ((u64)obj->car & 0x00FFFFFFFFFFFFFF));
+}
+
+static inline bool is_whitespace(char c) {
+    if (c == ' ' || c == '\t') return true;
+    return false;
+}
+
+static void skip_whitespace(cs_Context* c)
+{
+    while (is_whitespace(cur())) {
+        advance();
+    }
+}
+
+// returns true if the given character would be valid to be in a symbol (except at the start)
+static bool is_allowed_symbol_char(char c)
+{
+    if (c == '/' || c == '_' || c == '.' || c == '$' || c == '?') { return true; }
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) { return true; }
+    if (c >= '0' && c <= '9') return true;
+
+    return false;
+}
+
+// TODO:
+// (+|-)?[0-9]+ (\.[0-9]+)? (e(+|-)[0-9]+)?
+static cs_Object* parse_number(cs_Context* c) 
+{
+    i64 int_val = 0;
+    double float_val = 0;
+    bool is_neg = false;
+    bool is_float = false;
+    if (cur() == '+') advance();
+    if (cur() == '-') {
+        is_neg = true;
+        advance();
+    }
+
+    if (cur() <= '0' || cur() >= '9') {
+        return null;
+    }
+
+    do {
+        int_val += cur() - '0'; 
+        int_val *= 10;
+        advance();
+    } while (cur() >= '0' && cur() <= '9');
+
+    if (cur() == '.') {
+        advance();
+        is_float = true;
+        if (cur() == 'e') {
+            cs_error(c, CS_EXPONENT_AFTER_COMMA);
+            return null;
+        }
+
+        u64 decimals = 0; u32 count;
+        while (cur() >= '0' && cur() <= '9') {
+           decimals += cur() - '0'; 
+           decimals *= 10;
+           count++;
+           advance();
+        }
+        double frac = (double)decimals / pow(10, count);
+        float_val += frac;
+    }
+
+    // (e(+|-)[0-9]+)?
+    if (cur() == 'e') {
+        advance();
+        bool div;
+        if (cur() == '+') advance();
+        if (cur() == '-') { div = true; advance(); }
+        u64 exponent = 0;
+        while (cur() >= '0' && cur() <= '9') {
+           exponent += cur() - '0'; 
+           exponent *= 10;
+           advance();
+        }
+
+        if (is_float) {
+            if (div) {
+                float_val /= pow(10, exponent);
+            } else {
+                float_val *= pow(10, exponent);
+            }
+        } else {
+            if (div) {
+                int_val /= pow(10, exponent);
+            } else {
+                int_val *= pow(10, exponent);
+            }
+        }
+    }
+    
+    if (is_float) {
+        if (is_neg) float_val *= -1;
+        cs_Object* result = cs_make_object(c);
+        cs_obj_settype(result, CS_ATOM_FLOAT); result->cdr = *(void**)&float_val;
+        return result;
+    } else {
+        if (is_neg) int_val *= -1;
+        cs_Object* result = cs_make_object(c);
+        cs_obj_settype(result, CS_ATOM_INT); result->cdr = (void*)int_val;
+        return result;
+    }
+}
+
+static cs_Object* parse_str_lit(cs_Context* c)
+{
+    // parse string literal
+    char end_char = cur(); advance();
+    cs_StrBuilder sb = cs_strbuilder_init(5);
+    while (true) {
+        if (cur() == 0) {
+            cs_error(c, CS_UNEXPECTED_EOF);
+            exit(-1);
+        }
+        if (cur() == end_char) break;
+        if (cur() == '\\') {
+            advance();
+            char val = 0;
+            switch (cur()) {
+                case 'a':  { val = 0x07; } break;
+                case 'b':  { val = 0x08; } break;
+                case 'e':  { val = 0x1B; } break;
+                case 'f':  { val = 0x0C; } break;
+                case 'n':  { val = 0x0A; } break;
+                case 'r':  { val = 0x0D; } break;
+                case 't':  { val = 0x09; } break;
+                case 'v':  { val = 0x0B; } break;
+                case '\'': { val = 0x5C; } break;
+                case '\"': { val = 0x27; } break;
+                case '\?': { val = 0x3F; } break;
+                default: {
+                    cs_error(c, CS_INVALID_ESCAPE_CHAR);
+                    exit(-1);
+                } break;
+            }
+            cs_strbuilder_appendc(&sb, val);
+            continue;
+        }
+        cs_strbuilder_appendc(&sb, cur());
+        advance();
+    }
+    cs_Str* str = cs_strbuilder_finish(&sb);
+    cs_Object* result = cs_make_object(c);
+    cs_obj_settype(result, CS_ATOM_STR);
+    return result;
+}
+
+static u64 fnv1a(char* start, char* end)
+{
+    u64 magic_prime = 0x00000100000001b3;
+    u64 hash = 0xcbf29ce484222325;
+
+    for (; start < end; start++) {
+        hash = (hash ^ *start) * magic_prime;
+    }
+
+    return hash;
+}
+
+static cs_Object* parse_symbol(cs_Context* c) 
+{
+    char* start = c->cur;
+    while (!is_whitespace(cur())) {
+        advance();
+    }
+    char* end = c->cur;
+    u64 hash = fnv1a(start, end);
+    cs_Object* result = cs_make_object(c);
+    cs_obj_settype(result, CS_ATOM_SYMBOL);
+    result->cdr = (void*)hash;
+    return result;
+}
+
+// (true|false|nil|int|float|str|)
+static cs_Object* parse_atom(cs_Context* c)
+{
+    skip_whitespace(c);
+    switch (cur()) {
+        case '\0': {
+            cs_error(c, CS_UNEXPECTED_EOF);
+            exit(-1);
+        }
+        case '+':
+        case '-': {
+            cs_Object* res = parse_number(c);
+            if (res == null) return parse_symbol(c);
+        } break;
+        case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9': {
+            return parse_number(c);
+        } break;
+        case 'n': {
+            advance();
+            if (cur() != 'i') { retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 'l') { retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (is_allowed_symbol_char(cur())) {
+                retreat(); retreat(); retreat();
+                return parse_symbol(c);
+            } 
+            cs_Object* result = cs_make_object(c);
+            cs_obj_settype(result, CS_ATOM_NIL);
+            return result;
+        } break;
+        case 't': {
+            advance();
+            if (cur() != 'r') { retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 'u') { retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 'e') { retreat(); retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (is_allowed_symbol_char(cur())) {
+                retreat(); retreat(); retreat(); retreat();
+                return parse_symbol(c);
+            } 
+            cs_Object* result = cs_make_object(c);
+            cs_obj_settype(result, CS_ATOM_TRUE);
+            return result;
+        } break;
+        case 'f': {
+            advance();
+            if (cur() != 'a') { retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 'l') { retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 's') { retreat(); retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (cur() != 'e') { retreat(); retreat(); retreat(); retreat(); return parse_symbol(c); }
+            advance();
+            if (is_allowed_symbol_char(cur())) {
+                retreat(); retreat(); retreat(); retreat(); retreat();
+                return parse_symbol(c);
+            } 
+            cs_Object* result = cs_make_object(c);
+            cs_obj_settype(result, CS_ATOM_FALSE);
+            return result;
+        } break;
+        case '"':
+        case '\'': {
+            return parse_str_lit(c);
+        } break;
+    }
+    // TODO: finish this function
+    // TODO: continue with parsing
+}
+
+cs_Object* cs_parse_cstr(cs_Context* c, char* content, u32 len)
+{
+    
+}
