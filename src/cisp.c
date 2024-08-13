@@ -1,5 +1,6 @@
 #include "cisp.h"
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -31,6 +32,7 @@ void cs_error(cs_Context* c, cs_Error error) {
         }
         col++; cur++;
     }
+    c->err_col = col; c->err_line = line;
     // TODO: print callstack
 }
 
@@ -39,18 +41,19 @@ cs_Pool cs_pool_init(u32 element_size)
 {
     cs_Pool result;
     result.element_size = element_size;
-    result.mem = malloc(4096);
+    result.mem = malloc(CS_POOL_MEM_SIZE);
     pool_next(result.mem) = null;
     
     result.freelist = pool_data(result.mem);
     char* cur = result.freelist;
-    char* end = (char*)result.mem + 4096;
+    char* end = (char*)result.mem + CS_POOL_MEM_SIZE;
     while ((u64)cur < (u64)end) {
         *(void**)cur = cur + element_size;
         cur += element_size;
     }
     void** last = (void**)(end - element_size);
     last = null;
+    return result;
 }
 
 void* cs_pool_alloc(cs_Pool* p)
@@ -65,6 +68,7 @@ void* cs_pool_alloc(cs_Pool* p)
     return result;
 }
 
+// frees an element from the pool
 void cs_pool_free(cs_Pool* p, void** ptr)
 {
     if ((u64)ptr < (u64)p->freelist) {
@@ -83,9 +87,22 @@ void cs_pool_free(cs_Pool* p, void** ptr)
     return;
 }
 
+// resets the pool
+void cs_pool_clear(cs_Pool* p) {
+    char* cur = p->mem;
+    char* end = cur + 4096;
+    while ((u64)cur < (u64)end) {
+        *(void**)cur = cur + p->element_size;
+        cur += p->element_size;
+    }
+}
+
+// frees the pool
 void cs_pool_release(cs_Pool* p) {
     // TODO: support multiple buckets
     free(p->mem);
+    // indicates that the pool was freed (or never initialized)
+    p->element_size = 0; p->freelist = null;
 }
 
 /* ==== STR ==== */
@@ -159,7 +176,18 @@ cs_Object* cs_make_object(cs_Context* c)
 
 void cs_obj_settype(cs_Object *obj, cs_ObjectType type)
 {
-    obj->car = (void*)(((u64)type << 56) | ((u64)obj->car & 0x00FFFFFFFFFFFFFF));
+    obj->car = (void*)(((u64)type << 56) | ((u64)obj->car & CS_OBJECT_INV_TYPE_MASK));
+    if (type == CS_LIST) {
+        obj->car = (void*)((u64)obj->car & CS_OBJECT_INV_LIST_MASK); // set last bit to 0
+    } else {
+        obj->car = (void*) ((u64)obj->car | 0b1); // set last bit to 1
+    }
+}
+
+u16 cs_obj_gettype(cs_Object *obj)
+{
+    if (((u64)obj->car & 1) == 0) return CS_LIST;
+    return ((u64)obj->car & CS_OBJECT_TYPE_MASK) >> CS_OBJECT_TYPE_OFFSET;
 }
 
 static inline bool is_whitespace(char c) {
@@ -203,8 +231,8 @@ static cs_Object* parse_number(cs_Context* c)
     }
 
     do {
-        int_val += cur() - '0'; 
         int_val *= 10;
+        int_val += cur() - '0'; 
         advance();
     } while (cur() >= '0' && cur() <= '9');
 
@@ -305,6 +333,7 @@ static cs_Object* parse_str_lit(cs_Context* c)
         cs_strbuilder_appendc(&sb, cur());
         advance();
     }
+    advance();
     cs_Str* str = cs_strbuilder_finish(&sb);
     cs_Object* result = cs_make_object(c);
     cs_obj_settype(result, CS_ATOM_STR);
@@ -337,7 +366,14 @@ static cs_Object* parse_symbol(cs_Context* c)
     return result;
 }
 
-// (true|false|nil|int|float|str|)
+static cs_Object* parse_keyword(cs_Context* c)
+{
+    cs_Object* result = parse_symbol(c);
+    cs_obj_settype(result, CS_ATOM_KEYWORD);
+    return result;
+}
+
+// (true|false|nil|int|float|str|symbol|keyword)
 static cs_Object* parse_atom(cs_Context* c)
 {
     skip_whitespace(c);
@@ -350,6 +386,7 @@ static cs_Object* parse_atom(cs_Context* c)
         case '-': {
             cs_Object* res = parse_number(c);
             if (res == null) return parse_symbol(c);
+            return res;
         } break;
         case '0': case '1': case '2': case '3': case '4': case '5': case '6': case '7': case '8': case '9': {
             return parse_number(c);
@@ -406,12 +443,79 @@ static cs_Object* parse_atom(cs_Context* c)
         case '\'': {
             return parse_str_lit(c);
         } break;
+        case ':': {
+            return parse_keyword(c);
+        } break;
+        default: {
+            return parse_symbol(c);
+        } break;
     }
-    // TODO: finish this function
-    // TODO: continue with parsing
 }
 
+cs_Object* cs_parse_expr(cs_Context* c)
+{
+    cs_Object* result = null;
+    if (cur() == '(') {
+        advance();
+        // callable expr represented as a list
+        result = cs_make_object(c);
+        cs_obj_settype(result, CS_LIST);
+        result->car = cs_parse_expr(c);
+        cs_Object* cur = result;
+        while (cur() != ')') {
+            cs_Object* next_val = cs_parse_expr(c);
+            cs_Object* next = cs_make_object(c); // (cur) -> (next_val) -> (next_val) -> ..
+            cs_obj_settype(next, CS_LIST);
+            next->car = next_val;
+            cur->cdr = next;
+            cur = next;
+        }
+    } else if (cur() == '\'') {
+        // TODO: parse quote
+        cs_error(c, CS_UNEXPECTED_CHAR);
+    }
+    else result = parse_atom(c);
+    return result;
+}
+
+// NOTE: RESETS LAST USED OBJECT POOL (if you reuse your context)
 cs_Object* cs_parse_cstr(cs_Context* c, char* content, u32 len)
 {
-    
+    if (len == 0) len = strlen(content);
+    c->start = content;
+    c->cur = c->start; c->len = len;
+    // pool hopefully initalized at this point
+    cs_pool_clear(&c->obj_pool);
+    return cs_parse_expr(c);
+}
+
+cs_Object* cs_eval(cs_Context* c, cs_Object* code)
+{
+    // TODO: output objects in human readable format 
+    return code;
+}
+
+cs_Object* cs_run(cs_Context* c, char* content, u32 len)
+{
+    cs_Object* code = cs_parse_cstr(c, content, len);
+    return cs_eval(c, code);
+}
+
+char err_buf[512];
+char* cs_get_error_string(cs_Context* c)
+{
+    char* msg = null;
+    switch (c->err) {
+        case CS_OK: msg = "Success"; 
+        case CS_PARSER_ERRORS_START: msg = "!Invalid Error! at %d:%d";
+        case CS_EXPONENT_AFTER_COMMA: msg = "Invalid exponent after comma. Remove the comma or provide decimal places before the comma at %d:%d";
+        case CS_INVALID_ESCAPE_CHAR: msg = "Invalid Escape character at %d:%d";
+        case CS_UNEXPECTED_EOF: msg = "Unexpected End of Input at %d:%d";
+        case CS_UNEXPECTED_CHAR: msg = "Unexpected character at %d:%d";
+        case CS_RUNTIME_ERRORS_START: msg = "!Invalid Error! at %d:%d";
+        case CS_OUT_OF_MEM: msg = "Out of memory";
+        case CS_COUNT: msg = "!Invalid Error! at %d:%d";
+    }
+    snprintf(err_buf, 512, msg, c->err_col, c->err_line);
+    return err_buf;
 }

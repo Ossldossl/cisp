@@ -48,12 +48,17 @@ void cs_strbuilder_appends(cs_StrBuilder* b, char* c, u32 len);
 cs_Str* cs_strbuilder_finish(cs_StrBuilder* b);
 
 /* ==== MAIN ==== */
+#ifndef CS_POOL_MEM_SIZE
+#define CS_POOL_MEM_SIZE 4096
+#endif
+
 typedef enum {
     CS_OK,
     CS_PARSER_ERRORS_START,
     CS_EXPONENT_AFTER_COMMA,
     CS_INVALID_ESCAPE_CHAR,
     CS_UNEXPECTED_EOF,
+    CS_UNEXPECTED_CHAR,
     
     CS_RUNTIME_ERRORS_START,
     CS_OUT_OF_MEM,
@@ -67,6 +72,7 @@ typedef struct {
     char* start;
     u32 len;
     cs_Error err;
+    u32 err_col, err_line;
 } cs_Context;
 
 typedef enum {
@@ -85,24 +91,37 @@ typedef enum {
     CS_TYPECOUNT,
 } cs_ObjectType;
 
+#define CS_OBJECT_TYPE_OFFSET 56
+#define CS_OBJECT_TYPE_MASK 0xFF00000000000000
+#define CS_OBJECT_INV_TYPE_MASK 0x00FFFFFFFFFFFFFF
+#define CS_OBJECT_REFCOUNT_MASK 0x00FFFFFFFF000000
+#define CS_OBJECT_INV_LIST_MASK 0xFFFFFFFFFFFFFFFE
 typedef struct cs_Object {
     // lowest bit decides if object is an atom
     // 0b1 => atom
-    // 0b0 => pair
+    // 0b0 => list
 
     //  when obj is atom:
-    //      car: 0xTTCCCCRRRRRRRR01
+    //      car: 0xTTCCCCCCCCRRRR01
     //          T => type (8 bits)
-    //          C => refcount (16 bits)
+    //          C => refcount (32 bits)
     //          R => reserved
     //      cdr: 
     //          int, float: value 
     //          string, cfunc: pointer to string
     //          symbol, keyword: hash 
+    // when obj is list:
+    //      car: 0xPPPPPPPPPPPPPPPP
+    //          P => pointer to object
     struct cs_Object* car;
     struct cs_Object* cdr;
 } cs_Object;
 
 cs_Context cs_init();
-cs_Object* make_object(cs_Context* c);
+cs_Object* cs_parse_cstr(cs_Context* c, char* content, u32 len);
+cs_Object* cs_eval(cs_Context* c, cs_Object* code);
+cs_Object* cs_run(cs_Context* c, char* content, u32 len);
+char* cs_get_error_string(cs_Context* c);
+cs_Object* cs_make_object(cs_Context* c);
 void cs_obj_settype(cs_Object* obj, cs_ObjectType type);
+u16 cs_obj_gettype(cs_Object *obj);

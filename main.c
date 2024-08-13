@@ -21,8 +21,8 @@ int main(int argc, char** argv) {
         content[real_size] = 0;
 
         cs_Context ctx = cs_init();
-        //cs_Object* code = cs_parse_cstr(ctx, content, real_size);
-        //cs_Object* result = cs_eval(ctx, code);
+        cs_Object* result = cs_run(&ctx, content, real_size);
+        printf("%d", cs_obj_gettype(result));
         return 0;
     }
 // [] => run as repl
