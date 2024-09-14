@@ -22,7 +22,9 @@ int main(int argc, char** argv) {
 
         cs_Context ctx = cs_init();
         cs_Object* result = cs_run(&ctx, content, real_size);
-        printf("%d", cs_obj_gettype(result));
+        if (ctx.err != CS_OK) {
+            printf("ERROR: %s", cs_get_error_string(&ctx));
+        }
         return 0;
     }
 // [] => run as repl
