@@ -21,7 +21,7 @@ int main(int argc, char** argv) {
         content[real_size] = 0;
 
         cs_Context ctx = cs_init();
-        cs_Object* result = cs_run(&ctx, content, real_size);
+        cs_Code* result = cs_compile_file(&ctx, content, real_size);
         if (ctx.err != CS_OK) {
             printf("ERROR: %s", cs_get_error_string(&ctx));
         }

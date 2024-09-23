@@ -1,6 +1,5 @@
-(do
-    (+ 34 35)
-    (- 70 1)
-    (<< 1 3)
-    (map :keyword 69)
-)
+(if true
+    (do
+        (print "Hello, World!")
+        (+ 4 2)
+    ))

@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+const u32 tempvar_hash = 0x1d91e0b5;
+const cs_SSAVar ssavar_invalid = ssavar(0,0);
+
 void cs_error(cs_Context* c, cs_Error error) {
     c->err = error;
     if (c == null) return;
@@ -42,7 +45,7 @@ cs_Pool cs_pool_init(u32 element_size)
     pool_next(result.mem) = null;
     
     result.freelist = pool_data(result.mem);
-    char* cur = result.freelist;
+    char* cur = (char*)result.freelist;
     char* end = (char*)result.mem + CS_POOL_MEM_SIZE;
     while ((u64)cur < (u64)end) {
         *(void**)cur = cur + element_size;
@@ -159,6 +162,15 @@ cs_Str* cs_str_init(u32 len) {
     return result;
 }
 
+cs_Str* cs_make_str(char* data, u32 len)
+{
+    cs_Str* result = malloc(sizeof(cs_Str) + len + 1);
+    result->size = len;
+    memcpy_s(result->data, len+1, data, len);
+    result->data[len] = 0;
+    return result;
+}
+
 cs_StrBuilder cs_strbuilder_init(u32 cap)
 {
     cs_StrBuilder result;
@@ -202,11 +214,6 @@ cs_Str* cs_strbuilder_finish(cs_StrBuilder* b)
     return result;
 }
 
-/* ==== VM ==== */
-// TODO: arena allocator
-// TODO: implementent code generation
-
-
 /* ==== MAIN ==== */
 #define advance() (c->cur++)
 #define retreat() (c->cur--)
@@ -224,6 +231,53 @@ cs_Object* cs_make_object(cs_Context* c)
     cs_Object* result = cs_pool_alloc(&c->obj_pool);
     memset(result, 0, sizeof(cs_Object));
     return result;
+}
+
+u32 cs_ensure_cap(void** data, u32 element_size, u32* cur_cap, u32 wanted_cap)
+{
+    while (wanted_cap >= *cur_cap) {
+        *cur_cap = (*cur_cap) * 1.75;
+        *data = realloc(*data, element_size * (*cur_cap));
+    }
+    return *cur_cap;
+}
+
+cs_BasicBlock* cs_make_bb(cs_Context* c) 
+{
+    // TODO: use a better allocator for this
+    cs_BasicBlock* result = malloc(sizeof(cs_BasicBlock));
+    if (result == null) {
+        log_fatal("OUT OF MEMORY!");
+        exit(-1);
+    }
+    memset(result, 0, sizeof(cs_BasicBlock));
+    result->instrs = malloc(sizeof(cs_SSAIns) * DEFAULT_BB_INS_START_CAP);
+    if (result->instrs == null) {
+        log_fatal("OUT OF MEMORY!");
+        exit(-1);
+    }
+    result->instr_cap = DEFAULT_BB_INS_START_CAP; 
+    result->preds = malloc(sizeof(cs_BasicBlock*) * DEFAULT_BB_PRED_CAP);
+    if (result->preds == null) {
+        log_fatal("OUT OF MEMORY!");
+        exit(-1);
+    }
+    result->preds_cap = DEFAULT_BB_PRED_CAP;
+    return result;
+}
+
+#define cs_emit(c, dest, op, a, b) _cs_emit((c), (dest), (op), insarg((a)), insarg((a)))
+void _cs_emit(cs_Context* c, cs_SSAVar dest, cs_OpKind op, union ins_arg a, union ins_arg b)
+{
+    cs_BasicBlock* bb = c->cur_bb;
+    bb->instr_count += 1;
+    bb->instr_cap = cs_ensure_cap((void**)&bb->instrs, sizeof(cs_SSAIns), &bb->instr_cap, bb->instr_count);
+    bb->instrs[bb->instr_count-1] = (cs_SSAIns) {
+        .op = op,
+        .dest = dest,
+        .a_as = a,
+        .b_as = b,
+    };
 }
 
 void cs_obj_settype(cs_Object *obj, cs_ObjectType type)
@@ -289,9 +343,12 @@ static bool match(cs_Context* c, char* string)
     return true;
 }
 
-// TODO:
+static cs_SSAVar cs_parse_expr(cs_Context* c);
+static cs_SSAVar parse_while(cs_Context* c);
+static cs_SSAVar parse_function(cs_Context* c);
+
 // (+|-)?[0-9]+ (\.[0-9]+)? (e(+|-)[0-9]+)?
-static cs_Object* parse_number(cs_Context* c) 
+static cs_SSAVar parse_number(cs_Context* c) 
 {
     i64 int_val = 0;
     double float_val = 0;
@@ -304,7 +361,7 @@ static cs_Object* parse_number(cs_Context* c)
     }
 
     if (cur() < '0' || cur() > '9') {
-        return null;
+        return ssavar_invalid;
     }
 
     do {
@@ -319,7 +376,7 @@ static cs_Object* parse_number(cs_Context* c)
         is_float = true;
         if (cur() == 'e') {
             cs_error(c, CS_EXPONENT_AFTER_COMMA);
-            return null;
+            return ssavar_invalid;
         }
 
         u64 decimals = 0; u32 count = 0;
@@ -361,21 +418,18 @@ static cs_Object* parse_number(cs_Context* c)
         }
     }
     
+    cs_SSAVar dest = ssa_new_temp();
     if (is_float) {
         if (is_neg) float_val *= -1;
-        cs_Object* result = cs_make_object(c);
-        cs_obj_settype(result, CS_ATOM_FLOAT); 
-        result->cdr = reinterpret(float_val, void*);
-        return result;
+        cs_emit(c, dest, CS_LOADF, float_val, 0);
     } else {
         if (is_neg) int_val *= -1;
-        cs_Object* result = cs_make_object(c);
-        cs_obj_settype(result, CS_ATOM_INT); result->cdr = (void*)int_val;
-        return result;
+        cs_emit(c, dest, CS_LOADI, int_val, 0);
     }
+    return dest;
 }
 
-static cs_Object* parse_str_lit(cs_Context* c)
+static cs_SSAVar parse_str_lit(cs_Context* c)
 {
     // parse string literal
     char end_char = cur(); advance();
@@ -414,27 +468,12 @@ static cs_Object* parse_str_lit(cs_Context* c)
     }
     advance();
     cs_Str* str = cs_strbuilder_finish(&sb);
-    cs_Object* result = cs_make_object(c);
-    cs_obj_settype(result, CS_ATOM_STR);
-    result->cdr = (void*)str;
-    return result;
+    cs_SSAVar dest = ssa_new_temp();
+    cs_emit(c, dest, CS_LOADS, str, 0);
+    return dest;
 }
 
-static u32 fnv1a(char* start, char* end)
-{
-    u64 magic_prime = 16777619;
-    u32 hash = 2166136261;
-
-    for (; start < end; start++) {
-        hash = (hash ^ *start) * magic_prime;
-    }
-
-    return hash;
-}
-
-static cs_Object* cs_parse_expr(cs_Context* c);
-
-static cs_Object* parse_symbol(cs_Context* c) 
+static cs_SSAVar parse_symbol(cs_Context* c) 
 {
     char* start = c->cur;
     while (!is_whitespace(cur())) {
@@ -442,48 +481,46 @@ static cs_Object* parse_symbol(cs_Context* c)
     }
     char* end = c->cur;
     u64 hash = fnv1a(start, end);
-    cs_Object* result = cs_make_object(c);
-    cs_obj_settype(result, CS_ATOM_SYMBOL);
-    result->cdr = (void*)hash;
-    return result;
-}
-
-static cs_Object* parse_keyword(cs_Context* c)
-{
-    cs_Object* result = parse_symbol(c);
-    cs_obj_settype(result, CS_ATOM_KEYWORD);
-    return result;
-}
-
-static cs_Object* parse_function(cs_Context* c)
-{
-    skip_whitespace(c);   
-    if (cur() == '[') {
-        // parse arguments
+    if (hash == tempvar_hash) {
+        cs_error(c, CS_TEMP_RESERVED);
+        return ssavar_invalid;
     }
+    cs_SSAVar dest = ssa_new_temp();
+    cs_emit(c, dest, CS_LOADSYM, reinterpret(hash, i64), 0); 
+    return dest;
 }
 
-static cs_Object* parse_while(cs_Context* c) 
+static cs_SSAVar parse_keyword(cs_Context* c)
 {
-    skip_whitespace(c);
-    cs_Object* condition = cs_parse_expr(c);
-    
+    char* start = c->cur;
+    while (!is_whitespace(cur())) {
+        advance();
+    }
+    char* end = c->cur;
+    u64 hash = fnv1a(start, end);
+    if (hash == tempvar_hash) {
+        cs_error(c, CS_TEMP_RESERVED);
+        return ssavar_invalid;
+    }
+    cs_SSAVar dest = ssa_new_temp();
+    cs_emit(c, dest, CS_LOADK, reinterpret(hash, i64), 0); 
+    return dest;
 }
 
 // (true|false|nil|int|float|str|symbol|keyword)
-static cs_Object* parse_atom(cs_Context* c)
+static cs_SSAVar parse_atom(cs_Context* c)
 {
     skip_whitespace(c);
     switch (cur()) {
         case '\0': {
             cs_error(c, CS_UNEXPECTED_EOF);
-            return null;
+            return ssavar_invalid;
         }
         case '+':
         case '-': {
             char* cur_start = c->cur;
-            cs_Object* res = parse_number(c);
-            if (res == null) { 
+            cs_SSAVar res = parse_number(c);
+            if (ssa_eq(res, ssavar_invalid)) { 
                 c->cur = cur_start;
                 return parse_symbol(c);
             }
@@ -495,25 +532,25 @@ static cs_Object* parse_atom(cs_Context* c)
         case 'n': {
             advance();
             if (match(c, "il")) {
-                cs_Object* result = cs_make_object(c);
-                cs_obj_settype(result, CS_ATOM_NIL);
-                return result;
+                cs_SSAVar dest = ssa_new_temp();
+                cs_emit(c, dest, CS_LOADNIL, ssavar_invalid, ssavar_invalid);
+                return dest;
             } else return parse_symbol(c);
         } break;
         case 't': {
             advance();
             if (match(c, "rue")) {
-                cs_Object* result = cs_make_object(c);
-                cs_obj_settype(result, CS_ATOM_TRUE);
-                return result;
+                cs_SSAVar dest = ssa_new_temp();
+                cs_emit(c, dest, CS_LOADTRUE, ssavar_invalid, ssavar_invalid);
+                return dest;
             } else return parse_symbol(c);
         } break;
         case 'f': {
             advance();
             if (match(c, "alse")) {
-                cs_Object* result = cs_make_object(c);
-                cs_obj_settype(result, CS_ATOM_FALSE);
-                return result;
+                cs_SSAVar dest = ssa_new_temp();
+                cs_emit(c, dest, CS_LOADFALSE, ssavar_invalid, ssavar_invalid);
+                return dest;
             } else if (match(c, "n")) {
                 return parse_function(c);
             } else return parse_symbol(c);
@@ -537,15 +574,15 @@ static cs_Object* parse_atom(cs_Context* c)
     }
 }
 
-cs_Object* cs_parse_expr(cs_Context* c)
+cs_SSAVar cs_parse_expr(cs_Context* c)
 {
-    cs_Object* result = null;
+    cs_SSAVar dest = ssavar_invalid;
     skip_whitespace(c);
     if (cur() == '(') {
         advance();
         // callable expr represented as a list
-        result = cs_make_object(c);
-        cs_obj_settype(result, CS_LIST);
+        cs_emit(c, ssavar_invalid, CS_SCOPE_PUSH, ssavar_invalid, ssavar_invalid);
+
         result->car = cs_parse_expr(c);
         cs_Object* cur = result;
         while (cur() != ')') {
@@ -563,19 +600,42 @@ cs_Object* cs_parse_expr(cs_Context* c)
         // TODO: parse quote
         cs_error(c, CS_UNEXPECTED_CHAR);
     }
-    else result = parse_atom(c);
-    return result;
+    else dest = parse_atom(c);
+    return dest;
+}
+
+static cs_SSAVar parse_function(cs_Context* c)
+{
+    skip_whitespace(c);   
+    if (cur() == '[') {
+        // parse arguments
+    }
+}
+
+static cs_SSAVar parse_while(cs_Context* c) 
+{
+    skip_whitespace(c);
+    cs_Object* condition = cs_parse_expr(c);
+    
 }
 
 // NOTE: RESETS LAST USED OBJECT POOL (if you reuse your context)
-cs_Object* cs_parse_cstr(cs_Context* c, char* content, u32 len)
+void cs_parse_cstr(cs_Context* c, char* content, u32 len)
 {
     if (len == 0) len = strlen(content);
     c->start = content;
     c->cur = c->start; c->len = len;
     // pool hopefully initalized at this point
     cs_pool_clear(&c->obj_pool);
-    return cs_parse_expr(c);
+
+    cs_BasicBlock* entry = cs_make_bb(c);
+    entry->label = make_str("entry");
+    c->cur_bb = entry;
+    c->functions[0] = entry;
+    c->cur_temp_id = 0;
+    
+    cs_parse_expr(c);
+    return;
 }
 
 void cs_serialize_object(cs_Object* o)
@@ -603,7 +663,104 @@ void cs_serialize_object(cs_Object* o)
     }
 }
 
-cs_Object* cs_eval(cs_Context* c, cs_Object* code)
+void cs_serialize_bb(cs_BasicBlock* bb) {
+    printf("%s:\n", bb->label->data);
+    for (u32 i = 0; i < bb->instr_count; i++) {
+        cs_SSAIns* ins = &bb->instrs[i];
+        printf("%d.%d = ", ins->dest.hash, ins->dest.version);
+        printf("%s ", cs_OpKindStrings[ins->op]);
+        switch (ins->op) {
+        case CS_REF_RETAIN:
+        case CS_REF_RELEASE:
+        case CS_GETCAR:
+        case CS_GETCDR:
+        case CS_NOT: 
+        {
+            printf("%s\n", ins->a_as.int_ == 0 ? "false" : "true");
+        } break;
+        
+        case CS_ADD:
+        case CS_SUB:
+        case CS_MUL:
+        case CS_DIV:
+        case CS_LSHIFT:
+        case CS_RSHIFT:
+        case CS_GT:
+        case CS_LT:
+        case CS_EQ:
+        {
+            printf("%lld %lld\n", ins->a_as.int_, ins->b_as.int_);
+        } break;
+
+        case CS_AND:
+        case CS_OR:
+        {
+            printf("%s %s\n", ins->b_as.int_ == 0 ? "false" : "true", ins->a_as.int_ == 0 ? "false" : "true");
+        } break;
+        
+        case CS_LOADI:
+        {
+            printf("#%d.%d %lld\n", ins->a_as.var.hash, ins->a_as.var.version, ins->b_as.int_);
+        } break;
+        case CS_LOADF:
+        {
+            printf("#%d.%d %lf\n", ins->a_as.var.hash, ins->a_as.var.version, ins->b_as.double_);
+        } break;
+
+        case CS_LOADS:
+        {
+            printf("#%d.%d %s\n", ins->a_as.var.hash, ins->a_as.var.version, ins->b_as.str_->data);
+        } break;
+
+        case CS_LOADSYM:
+        case CS_LOADK:
+        {
+            printf("#%d.%d %llu\n", ins->a_as.var.hash, ins->a_as.var.version, ins->b_as.int_);
+        } break;
+
+        case CS_LOADFALSE:
+        {
+            printf("true\n");
+        } break;
+        case CS_LOADTRUE:
+        {
+            printf("false\n");
+        } break;
+
+        case CS_LOADNIL:
+        {
+            printf("nil\n");
+        } break;
+
+        case CS_SETCAR:
+        case CS_SETCDR:
+        case CS_CONS:
+        {
+            printf("#%d.%d #%d.%d\n", ins->a_as.var.hash, ins->a_as.var.version, ins->b_as.var.hash, ins->b_as.var.version);
+        } break;
+
+        case CS_SET_VAR:
+        {
+            printf("%lld %lld\n", ins->a_as.int_, ins->b_as.int_);
+        } break;
+
+        case CS_GET_VAR:
+        {
+            printf("%lld\n", ins->a_as.int_);
+        } break;
+
+        case CS_SCOPE_PUSH:
+        case CS_SCOPE_POP:
+        default:
+          break;
+        }
+    }
+    u8* a_label = bb->a->label->size > 0 ? bb->a->label->data : null;
+    u8* b_label = bb->b->label->size > 0 ? bb->b->label->data : null;
+    printf("BR %d.%d %s %s", bb->jump_cond.hash, bb->jump_cond.version, a_label, b_label);
+}
+
+cs_Object* cs_eval(cs_Context* c, cs_Code* code)
 {
     // TODO: evaluation
     if (code == null) printf("<empty>\n");
@@ -611,13 +768,17 @@ cs_Object* cs_eval(cs_Context* c, cs_Object* code)
     return code;
 }
 
-cs_Object* cs_run(cs_Context* c, char* content, u32 len)
+cs_Code* cs_compile_file(cs_Context* c, char* content, u32 len)
 {
-    const char* a = "+";
-    const char* b = "(";
-    u32 ah = fnv1a(a, a+1); u32 bh = fnv1a(b, b+1);
-    cs_Object* code = cs_parse_cstr(c, content, len);
-    return cs_eval(c, code);
+    cs_parse_cstr(c, content, len);
+    if (c->err != CS_OK) {
+        log_debug("had error, no serialization!");
+        return null;
+    }
+    // todo
+    cs_BasicBlock* bb = c->functions[0];
+    cs_serialize_bb(bb);
+    return null;
 }
 
 char err_buf[512];
@@ -630,6 +791,7 @@ char* cs_get_error_string(cs_Context* c)
         case CS_INVALID_ESCAPE_CHAR : { msg = "Invalid Escape character at %d:%d"; break; }
         case CS_UNEXPECTED_EOF      : { msg = "Unexpected End of Input at %d:%d"; break; }
         case CS_UNEXPECTED_CHAR     : { msg = "Unexpected character at %d:%d"; break; }
+        case CS_TEMP_RESERVED       : { msg = "Symbol '__temp' is reserved by the compiler. (%d:%d)"; break; }
         case CS_OUT_OF_MEM          : { msg = "Out of memory"; break; }
         default                     : { msg = "!Invalid Error! at %d:%d"; break; }
     }
