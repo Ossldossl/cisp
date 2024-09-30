@@ -4,7 +4,8 @@
 
 #define null ((void*)0)
 #define reinterpret(value, as) (*(as*)&value)
-#define advance_ptr(ptr, by) (((u8*)ptr) + by)
+#define advance_ptr(ptr, by) ((typeof(ptr))(((u8*)ptr) + by))
+#define todo(what) log_fatal(#what " is not implemented yet!\n");
 
 typedef signed char         i8;
 typedef short               i16;
@@ -55,7 +56,7 @@ typedef struct {
 
 #define cs_strhead(str) ((cs_Str*) (((u64)(str)) - 4))
 #define cstr(str) (char*)(&((str)->data))
-#define strlit(str) ((cs_Str) {.data=str, .len=sizeof(str)})
+#define strlit(str) cs_make_str(str, sizeof(str))
 
 cs_Str* cs_make_str(char* data, u32 len);
 #define make_str(str) cs_make_str(str, sizeof(str)-1);

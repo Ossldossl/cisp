@@ -38,6 +38,8 @@
 *.x86_64
 *.hex
 
+*.rdi
+
 # Debug files
 *.dSYM/
 *.su

@@ -1,15 +1,24 @@
 #pragma once
-#include "map.h"
-#include "common.h"
 
 #define DEFAULT_ARENA_BUCKET_SIZE 4096
 #define DEFAULT_BB_INS_START_CAP 5
 #define DEFAULT_BB_PRED_CAP 1
+#define FUNCTION_MAX_ARGS 32
+
+#include "common.h"
+#include "map.h"
+#include "btree.h"
+
+#define check_ssavar(var) if (ssa_eq(var, ssavar_invalid)) return ssavar_invalid;
 
 /* ==== MAIN ==== */
 typedef struct cs_BasicBlock cs_BasicBlock;
+typedef struct cs_BasicBlockNode cs_BasicBlockNode;
 typedef struct cs_Context cs_Context;
 typedef struct cs_Object cs_Object;
+typedef struct cs_Function cs_Function;
+typedef struct cs_FunctionBody cs_FunctionBody;
+typedef struct cs_Scope cs_Scope;
 typedef struct cs_SSAVar cs_SSAVar;
 typedef struct cs_SSAIns cs_SSAIns;
 typedef struct cs_SSAPhi cs_SSAPhi;
@@ -31,6 +40,13 @@ enum cs_Error {
     CS_UNEXPECTED_EOF,
     CS_UNEXPECTED_CHAR,
     CS_TEMP_RESERVED,
+    CS_ENTRY_RESERVED,
+    CS_FN_NOT_ALLOWED_HERE,
+    CS_WHILE_NOT_ALLOWED_HERE,
+    CS_VAL_NOT_CALLABLE,
+    CS_SYMBOL_NOT_FOUND,
+    CS_INVALID_NUMBER_OF_ARGUMENTS,
+    CS_TOO_MANY_ARGUMENTS,
 
     CS_RUNTIME_ERRORS_START,
     CS_OUT_OF_MEM,
@@ -51,10 +67,12 @@ enum cs_ObjectType {
     CS_ATOM_KEYWORD,
 
     CS_LIST,
+    CS_FUNC,    //cdr ^= cs_Function*
+    CS_CFUNC,   // cdr ^= cs_Function*
 
     // used only for bytecode
-    CS_REG, // cdr ^= reg index
-    CS_BLOCK, // cdr ^= basic block pointer
+    CS_REG,     // cdr ^= reg index
+    CS_BLOCK,   // cdr ^= basic block pointer
 
     CS_TYPECOUNT,
 };
@@ -78,6 +96,8 @@ struct cs_Object {
     //          int, float: value 
     //          string, cfunc: pointer to string
     //          symbol, keyword: hash 
+    //          func: fn_id
+    //          cfunc: fn_ptr
     // when obj is list:
     //      car: 0xPPPPPPPPPPPPPPPP
     //          P => pointer to object
@@ -95,11 +115,14 @@ struct cs_Context {
     cs_Error err;
     u32 err_col, err_line;
 
-    cs_BasicBlock** functions; // [0] == entry point
-    u32 fns_cap, fns_used;
+    cs_Arena functions;  // TODO: maybe another datastructure?
+    u32 cur_fn_id;
+    u32 cur_bb_id;
 
+    cs_Scope* cur_scope;
     cs_BasicBlock* cur_bb;
-    u32 cur_temp_id;
+
+    u64 cur_temp_id;
 
     // vm 
     cs_Object regs[16]; 
@@ -109,11 +132,13 @@ cs_Context cs_init();
 cs_Object* cs_run(cs_Context* c, cs_Code* code);
 cs_Code* cs_compile_file(cs_Context* c, char* content, u32 len);
 char* cs_get_error_string(cs_Context* c);
+void cs_cfunc(cs_Context* c, void* fn, i8 arg_count);
 cs_Object* cs_make_object(cs_Context* c);
 void cs_obj_settype(cs_Object* obj, cs_ObjectType type);
 u16 cs_obj_gettype(cs_Object *obj);
 
 /* ==== VM ==== */
+
 #define CS_OPKIND_LIST \
     X(CS_ADD) \
     X(CS_SUB) \
@@ -127,10 +152,11 @@ u16 cs_obj_gettype(cs_Object *obj);
     X(CS_GT) \
     X(CS_LT) \
     X(CS_EQ) \
+    X(CS_CALL) \
     X(CS_SCOPE_PUSH) \
     X(CS_SCOPE_POP) \
-    X(CS_SET_VAR) \
-    X(CS_GET_VAR) \
+    X(CS_SET_LOCAL) \
+    X(CS_GET_LOCAL) \
     X(CS_CONS) \
     X(CS_SETCAR) \
     X(CS_GETCAR) \
@@ -138,6 +164,7 @@ u16 cs_obj_gettype(cs_Object *obj);
     X(CS_GETCDR) \
     X(CS_LOADI) \
     X(CS_LOADF) \
+    X(CS_LOADFUN) \
     X(CS_LOADS) \
     X(CS_LOADTRUE) \
     X(CS_LOADFALSE) \
@@ -156,9 +183,11 @@ enum cs_OpKind {
 #undef X
 #define X(val) #val,
 
+#ifdef CISP_STRINGS_IMPLEMENTATION
 const char* cs_OpKindStrings[] = {
     CS_OPKIND_LIST
 };
+#endif
 
 #define ssavar(h, v) (cs_SSAVar) {.hash=h, .version=v}
 #define ssa_new_temp() ssavar(tempvar_hash, c->cur_temp_id++)
@@ -176,8 +205,32 @@ struct cs_SSAIns {
         double double_;
         i64 int_;
         cs_Str* str_;
+        cs_BasicBlock* bb_;
     } a_as, b_as;
     cs_OpKind op;
+};
+
+struct cs_FunctionBody {
+    u32* args;
+    i8 arg_count; // negative for native functions
+    u8 calls; // for eventual inlining and dce
+    union {
+        void* native_func;
+        cs_BasicBlock* entry; // the first phis are always the arguments
+    };
+    cs_SSAVar return_val;
+};
+
+struct cs_Function {
+    cs_Str* title; // format: name_of_function" "arity
+    cs_FunctionBody* variants;
+    u8 variant_count;
+};
+
+struct cs_Scope {
+    struct cs_Scope* up;
+    cs_HMap locals; // map_of (cs_Object)
+    cs_HMap functions; // map_of (u32 => (fn_id)) 
 };
 
 struct cs_SSAPhi {
@@ -187,13 +240,18 @@ struct cs_SSAPhi {
     u8 option_count;
 };
 
+struct cs_BasicBlockNode {
+    cs_BasicBlock* head;
+    cs_BasicBlockNode* tail;
+};
+
 struct cs_BasicBlock {
     cs_SSAPhi phis_head;
     cs_SSAIns* instrs;
     u32 instr_cap; u32 instr_count;
     // links
-    cs_BasicBlock** preds;
-    u16 preds_cap; u16 preds_count;
+    cs_BasicBlockNode* preds_start;
+    bool visited; 
     struct cs_BasicBlock* a;
     struct cs_BasicBlock* b;
     cs_SSAVar jump_cond; // hash == 0 if always a

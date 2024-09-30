@@ -5,6 +5,7 @@
 #include "src/console.h"
 
 int main(int argc, char** argv) {
+    init_console();
     if (argc == 2) {
         // [file] => run file and exit
         FILE* f;

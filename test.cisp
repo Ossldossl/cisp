@@ -1,5 +1,5 @@
-(if true
-    (do
-        (print "Hello, World!")
-        (+ 4 2)
-    ))
+(defn test_function [x] (test_function x))
+
+(while (test_function 34)
+    (test_function 69)
+)
