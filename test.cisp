@@ -1,5 +1,7 @@
-(defn test_function [x] (test_function x))
+(defn square [x] (* x x))
 
-(while (test_function 34)
-    (test_function 69)
+(defn result []
+    (+ (square 2) 6)
 )
+
+(result)

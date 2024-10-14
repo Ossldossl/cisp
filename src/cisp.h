@@ -39,6 +39,7 @@ enum cs_Error {
     CS_INVALID_ESCAPE_CHAR,
     CS_UNEXPECTED_EOF,
     CS_UNEXPECTED_CHAR,
+    CS_MISSING_PAREN,
     CS_TEMP_RESERVED,
     CS_ENTRY_RESERVED,
     CS_FN_NOT_ALLOWED_HERE,
@@ -117,6 +118,8 @@ struct cs_Context {
 
     cs_Arena functions;  // TODO: maybe another datastructure?
     u32 cur_fn_id;
+
+    cs_Arena bbs;
     u32 cur_bb_id;
 
     cs_Scope* cur_scope;
@@ -140,18 +143,70 @@ u16 cs_obj_gettype(cs_Object *obj);
 /* ==== VM ==== */
 
 #define CS_OPKIND_LIST \
-    X(CS_ADD) \
-    X(CS_SUB) \
-    X(CS_MUL) \
-    X(CS_DIV) \
+    /* binops i=int int; v = var var; vi = var int; ..*/ \
+    X(CS_ADDI) \
+    X(CS_ADDV) \
+    X(CS_ADDVI) \
+    X(CS_ADDF) \
+    X(CS_ADDVF) \
+    X(CS_ADDS) \
+    X(CS_SUBI) \
+    X(CS_SUBV) \
+    X(CS_SUBVI) \
+    X(CS_SUBF) \
+    X(CS_SUBVF) \
+    X(CS_MULI) \
+    X(CS_MULV) \
+    X(CS_MULVI) \
+    X(CS_MULF) \
+    X(CS_MULVF) \
+    X(CS_DIVI) \
+    X(CS_DIVV) \
+    X(CS_DIVVI) \
+    X(CS_DIVF) \
+    X(CS_DIVVF) \
+    X(CS_MODI) \
+    X(CS_MODV) \
+    X(CS_MODVI) \
+    X(CS_ANDI) \
+    X(CS_ANDV) \
+    X(CS_ANDVI) \
+    X(CS_ORI) \
+    X(CS_ORV) \
+    X(CS_ORVI) \
+    X(CS_LSHIFTI) \
+    X(CS_LSHIFTV) \
+    X(CS_LSHIFTVI) \
+    X(CS_RSHIFTI) \
+    X(CS_RSHIFTV) \
+    X(CS_RSHIFTVI) \
+    X(CS_GTI) \
+    X(CS_GTV) \
+    X(CS_GTVI) \
+    X(CS_GTF) \
+    X(CS_GTVF) \
+    X(CS_LTI) \
+    X(CS_LTV) \
+    X(CS_LTVI) \
+    X(CS_LTF) \
+    X(CS_LTVF) \
+    X(CS_GEQI) \
+    X(CS_GEQV) \
+    X(CS_GEQVI) \
+    X(CS_GEQF) \
+    X(CS_GEQVF) \
+    X(CS_LEQI) \
+    X(CS_LEQV) \
+    X(CS_LEQVI) \
+    X(CS_LEQF) \
+    X(CS_LEQVF) \
+    X(CS_EQI) \
+    X(CS_EQV) \
+    X(CS_EQVI) \
+    X(CS_EQF) \
+    X(CS_EQVF) \
+    \
     X(CS_NOT) \
-    X(CS_AND) \
-    X(CS_OR) \
-    X(CS_LSHIFT) \
-    X(CS_RSHIFT) \
-    X(CS_GT) \
-    X(CS_LT) \
-    X(CS_EQ) \
     X(CS_CALL) \
     X(CS_SCOPE_PUSH) \
     X(CS_SCOPE_POP) \
@@ -173,7 +228,6 @@ u16 cs_obj_gettype(cs_Object *obj);
     X(CS_LOADK) \
     X(CS_REF_RETAIN) \
     X(CS_REF_RELEASE) \
-
 
 #define X(val) val,
 
@@ -212,8 +266,9 @@ struct cs_SSAIns {
 
 struct cs_FunctionBody {
     u32* args;
-    i8 arg_count; // negative for native functions
-    u8 calls; // for eventual inlining and dce
+    i8 arg_count;   // negative for native functions
+    u8 calls;       // for eventual inlining and dce
+    cs_BasicBlock* return_bb;
     union {
         void* native_func;
         cs_BasicBlock* entry; // the first phis are always the arguments
@@ -252,6 +307,7 @@ struct cs_BasicBlock {
     // links
     cs_BasicBlockNode* preds_start;
     bool visited; 
+    struct cs_BasicBlock* return_address;
     struct cs_BasicBlock* a;
     struct cs_BasicBlock* b;
     cs_SSAVar jump_cond; // hash == 0 if always a
