@@ -1,7 +1,8 @@
-(defn square [x] (* x x))
-
-(defn result []
-    (+ (square 2) 6)
+(defn fib [n]
+  (if (<= 2 n)
+    (+ (fib (- n 1)) (fib (- n 2)))
+    n
+  )
 )
 
-(result)
+(+ (fib 28) 2)

@@ -794,6 +794,10 @@ static cs_SSAVar gen_atom(cs_Context* c)
 
 static void cs_add_preds_for_fn(cs_Context* c, cs_BasicBlock* cur, cs_BasicBlock* last_bb, cs_SSAVar result_dest)
 {
+    if (cur == last_bb) {
+        cur->visited = true;
+        return;
+    }
     if ((cur->a == null && cur->b == null)) {
         log_debug("hi");
         if (cur->instr_count > 0) {
@@ -1190,11 +1194,14 @@ cs_SSAVar cs_parse_expr(cs_Context* c)
         u32 len = snprintf(buf, 256, "%s.return_to#%d", c->cur_bb->label->data, c->cur_bb_id);
         return_bb->label = cs_make_str(buf, len);
 
+        cs_SSAVar result = ssa_new_temp();
+        cs_bb_add_phi(return_bb, result, fn_variant->return_val);
+
         // return address
         c->cur_bb->return_address = return_bb;
-
         c->cur_bb = return_bb;
-        return fn_variant->return_val;
+
+        return result;
     } else if (cur() == '\'') {
         // TODO: parse quote
         cs_error(c, CS_UNEXPECTED_CHAR);
