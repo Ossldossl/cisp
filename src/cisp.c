@@ -345,7 +345,7 @@ cs_BasicBlock* cs_make_bb(cs_Context* c)
 void cs_bb_add_phi(cs_BasicBlock* bb, cs_SSAVar dest, cs_SSAVar phi_option)
 {
     cs_SSAPhi* cur = &bb->phis_head;
-    while (!ssa_eq(cur->dest, ssavar_invalid)) {
+    while (!ssa_invalid(cur->dest)) {
         if (ssa_eq(cur->dest, dest)) {
             cur->option_count += 1;
             cur->options = realloc(cur->options, cur->option_count * sizeof(cs_SSAVar));
@@ -403,56 +403,57 @@ void cs_bb_call(cs_BasicBlock* from, cs_FunctionBody* variant)
     cs_bb_add_pred(variant->entry, from);
 }
 
-cs_Scope* cs_scope_push(cs_Context* c)
+cs_ComScope* cs_comscope_push(cs_Context* c)
 {
-    cs_Scope* result = malloc(sizeof(cs_Scope));
-    result->locals = cs_hm_init(sizeof(cs_Object));
+    cs_ComScope* result = arena_alloc(&c->comscopes, sizeof(cs_ComScope));
+    result->locals = cs_hm_init(sizeof(cs_SSAVar));
     result->functions = cs_hm_init(sizeof(u32));
-    result->up = c->cur_scope;
     c->cur_scope = result;
     return result;
 }
 
-void cs_scope_pop(cs_Context* c)
+void cs_comscope_pop(cs_Context* c)
 {
-    cs_Scope* prev = c->cur_scope->up;
     cs_hm_free(&c->cur_scope->locals);
     cs_hm_free(&c->cur_scope->functions);
-    free(c->cur_scope);
-    c->cur_scope = prev;
+    arena_free_last(&c->comscopes);
+    c->cur_scope = advance_ptr(c->cur_scope, -sizeof(cs_ComScope));
 }
 
-cs_Object* cs_scope_lookup(cs_Context* c, u32 hash)
+cs_SSAVar cs_comscope_lookup(cs_Context* c, u32 hash)
 {
-    cs_Scope* cur = c->cur_scope;
+    cs_ComScope* cur = c->cur_scope;
     while (cur) {
-        cs_Object* result = cs_hm_geth(&cur->locals, hash);
-        if (result != null) return result;
-        cur = cur->up;
+        cs_SSAVar* result = cs_hm_geth(&cur->locals, hash);
+        if (result != null) return *result;
+        cur = advance_ptr(c->cur_scope, -sizeof(cs_ComScope));
     }
-    return null;
+    return ssavar_invalid;
 }
 
-u32* cs_scope_set_fn(cs_Scope* s, u32 hash)
+cs_SSAVar cs_comscope_set(cs_ComScope* s, u32 hash, cs_SSAVar var)
+{
+    if (s == null) return ssavar_invalid;
+    cs_SSAVar* p = cs_hm_seth(&s->locals, hash);
+    if (p == null) return ssavar_invalid;
+    *p = var;
+    return var;
+}
+
+u32* cs_comscope_set_fn(cs_ComScope* s, u32 hash)
 {
     if (s == null) return null;
     return cs_hm_seth(&s->functions, hash);
 }
 
-cs_Object* cs_scope_set(cs_Scope* s, u32 hash)
-{
-    if (s == null) return null;
-    return cs_hm_seth(&s->locals, hash);
-}
-
 // looks for static functions in scope
 u32* cs_scope_lookup_fn(cs_Context* c, u32 hash)
 {
-    cs_Scope* cur = c->cur_scope;
+    cs_ComScope* cur = c->cur_scope;
     while (cur) {
         u32* result = cs_hm_geth(&cur->functions, hash);
         if (result != null) return result;
-        cur = cur->up;
+        cur = advance_ptr(c->cur_scope, -sizeof(cs_ComScope));
     }
     return null;
 }
@@ -463,19 +464,14 @@ cs_Context cs_init()
     result.functions = arena_init();
     result.bbs = arena_init();
     result.obj_pool = cs_pool_init(sizeof(cs_Object));
-    cs_scope_push(&result);
+    result.comscopes = arena_init();
+    cs_comscope_push(&result);
     return result;
 }
 
 void cs_cfunc(cs_Context* c, void* fn, i8 arg_count)
 {
     // TODO: cfunc
-}
-
-void cs_set_local(cs_Context* c, cs_Str* name, cs_Object value)
-{
-    cs_Object* val = cs_hm_sets(&c->cur_scope->locals, name);
-    *val = value;
 }
 
 #define cs_emit(c, dest, op, a, b) _cs_emit((c), (dest), (op), insarg((a)), insarg((b)))
@@ -749,7 +745,7 @@ static cs_SSAVar gen_atom(cs_Context* c)
         case '-': {
             char* cur_start = c->cur;
             cs_SSAVar res = gen_number(c);
-            if (ssa_eq(res, ssavar_invalid)) { 
+            if (ssa_invalid(res)) { 
                 c->cur = cur_start;
                 return gen_symbol(c);
             }
@@ -911,7 +907,7 @@ static u32 parse_function(cs_Context* c, u32 hash)
 
     if (hash != 0) {
         // connect name to function id
-        u32* slot = cs_scope_set_fn(c->cur_scope, hash);
+        u32* slot = cs_comscope_set_fn(c->cur_scope, hash);
         if (slot == null) return 0;
         *slot = fn_id;
     }
@@ -926,11 +922,12 @@ static u32 parse_function(cs_Context* c, u32 hash)
     fb->return_val = ssa_new_temp();
 
     c->cur_bb = entry;
+    cs_emit(c, ssavar_invalid, CS_SCOPE_PUSH, ssavar_invalid, ssavar_invalid);
 
     // parse & generate body
     while (cur() != ')') {
         cs_SSAVar res = cs_parse_expr(c);
-        if (ssa_eq(res, ssavar_invalid)) {
+        if (ssa_invalid(res)) {
             return 0;
         }
         skip_whitespace(c);
@@ -939,12 +936,14 @@ static u32 parse_function(cs_Context* c, u32 hash)
 
     if (c->cur_bb != entry) {
         cs_add_preds_for_fn(c, fb->entry, last_bb, fb->return_val);
+        c->cur_bb = last_bb;
+        cs_emit(c, ssavar_invalid, CS_SCOPE_POP, ssavar_invalid, ssavar_invalid);
     } else {
-        // TODO: what to do about recursive functions???????????
         entry->visited = true;
         // completely forget the last bb, since it serves no purpose
         entry->jump_cond = ssavar_return;
         entry->a = null;
+        cs_emit(c, ssavar_invalid, CS_SCOPE_POP, ssavar_invalid, ssavar_invalid);
         fb->return_bb = entry;
         if (entry->instr_count > 0) {
             cs_SSAVar last_res = entry->instrs[entry->instr_count-1].dest;
@@ -1049,6 +1048,36 @@ static cs_SSAVar gen_if(cs_Context* c)
     return return_val;
 }
 
+cs_SSAVar gen_let(cs_Context* c)
+{
+    skip_whitespace(c);
+    cs_SSAVar last = ssavar_invalid;
+    while (cur() == '(') {
+        advance();
+        skip_whitespace(c);
+        u32 hash = parse_symbol(c);
+        if (hash == 0) return ssavar_invalid;
+        cs_SSAVar val = cs_parse_expr(c);
+
+        // mark new version of variable
+        cs_SSAVar prev = cs_comscope_lookup(c, hash);
+        if (ssa_invalid(prev)) {
+            // version 0 if variable does not already exist
+            last = cs_comscope_set(c->cur_scope, hash, ssavar(hash, 0));
+        } else {
+            // upgrade version of existing variable
+            prev.version += 1;
+            last = cs_comscope_set(c->cur_scope, hash, prev);
+        }
+        
+        if (ssa_invalid(last)) {
+            log_fatal("failed to set var");
+            return ssavar_invalid;
+        }
+    }
+    return last;
+}
+
 cs_SSAVar gen_binop(cs_Context* c, cs_OpKind op)
 {
     cs_SSAVar arg_a = cs_parse_expr(c);
@@ -1094,13 +1123,11 @@ cs_SSAVar cs_parse_expr(cs_Context* c)
                 cs_emit(c, dest, CS_LOADFUN, (i64)fn_id, 0ll);
                 return dest;
             } break;
-            case k_let: {
-                todo(let);
-            } break;
-
+            
             case k_while: { return gen_while(c); } break;
             case k_if   : { return gen_if(c); } break;
             case k_do   : { return gen_do(c); } break;
+            case k_let  : { return gen_let(c); } break;
 
             case k_plus  : { return gen_binop(c, CS_ADDV); } break;
             case k_minus : { return gen_binop(c, CS_SUBV); } break;
@@ -1128,7 +1155,7 @@ cs_SSAVar cs_parse_expr(cs_Context* c)
         // function to call
         cs_Function* fn = null;
         if (last_instr.op == CS_LOADFUN) {
-            // function was created just for calling its
+            // function was created just for calling it
             c->cur_bb->instr_count--; // remove last instruction, since we statically add the call
             fn = cs_get_fn(c, last_instr.a_as.int_);
         } else if (last_instr.op == CS_LOADSYM) {
@@ -1137,8 +1164,8 @@ cs_SSAVar cs_parse_expr(cs_Context* c)
             u32* fn_id = cs_scope_lookup_fn(c, hash);
             if (fn_id == null) {
                 // check if symbol points to a variable holding the function ptr
-                cs_Object* var = cs_scope_lookup(c, hash);
-                if (var == null) {
+                cs_SSAVar var = cs_comscope_lookup(c, hash);
+                if (ssa_invalid(var)) {
                     cs_error(c, CS_SYMBOL_NOT_FOUND);
                     return ssavar_invalid;
                 }
@@ -1236,7 +1263,7 @@ void cs_parse_cstr(cs_Context* c, char* content, u32 len)
     cs_SSAVar result;
     do {
         result = cs_parse_expr(c);
-    } while (!ssa_eq(result, ssavar_invalid));
+    } while (!ssa_invalid(result));
 
     return;
 }
@@ -1280,7 +1307,7 @@ void cs_serialize_bb(cs_BasicBlock* bb) {
 
     // print phis
     cs_SSAPhi* cur_phi = &bb->phis_head;
-    while (!ssa_eq(cur_phi->dest, ssavar_invalid)) {
+    while (!ssa_invalid(cur_phi->dest)) {
         if (cur_phi->dest.hash == tempvar_hash) {
             printf("PHI __temp.%u = ", cur_phi->dest.version);
         } else {
@@ -1479,7 +1506,7 @@ void cs_serialize_bb(cs_BasicBlock* bb) {
     }
     u8* a_label = bb->a != null ? bb->a->label->data : null;
     u8* b_label = bb->b != null ? bb->b->label->data : null;
-    if (ssa_eq(bb->jump_cond, ssavar_invalid)) {
+    if (ssa_invalid(bb->jump_cond)) {
         printf("BR true %s\n", a_label);
     } else if (ssa_eq(bb->jump_cond, ssavar_call)) {
         printf("RETURN_TO: %s\n", bb->return_address->label->data);

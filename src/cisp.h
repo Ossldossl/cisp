@@ -19,6 +19,7 @@ typedef struct cs_Object cs_Object;
 typedef struct cs_Function cs_Function;
 typedef struct cs_FunctionBody cs_FunctionBody;
 typedef struct cs_Scope cs_Scope;
+typedef struct cs_ComScope cs_ComScope;
 typedef struct cs_SSAVar cs_SSAVar;
 typedef struct cs_SSAIns cs_SSAIns;
 typedef struct cs_SSAPhi cs_SSAPhi;
@@ -122,7 +123,8 @@ struct cs_Context {
     cs_Arena bbs;
     u32 cur_bb_id;
 
-    cs_Scope* cur_scope;
+    cs_Arena comscopes;
+    cs_ComScope* cur_scope;
     cs_BasicBlock* cur_bb;
 
     u64 cur_temp_id;
@@ -246,6 +248,7 @@ const char* cs_OpKindStrings[] = {
 #define ssavar(h, v) (cs_SSAVar) {.hash=h, .version=v}
 #define ssa_new_temp() ssavar(tempvar_hash, c->cur_temp_id++)
 #define ssa_eq(a, b) ((a.hash == b.hash) && (a.version == b.version))
+#define ssa_invalid(s) (ssa_eq(s, ssavar_invalid))
 struct cs_SSAVar {
     u32 hash;
     u32 version;
@@ -282,9 +285,12 @@ struct cs_Function {
     u8 variant_count;
 };
 
-struct cs_Scope {
-    struct cs_Scope* up;
+/*struct cs_Scope {
     cs_HMap locals; // map_of (cs_Object)
+};*/
+
+struct cs_ComScope {
+    cs_HMap locals; // map_of (cs_SSAVar)
     cs_HMap functions; // map_of (u32 => (fn_id)) 
 };
 
