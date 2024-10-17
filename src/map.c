@@ -22,6 +22,10 @@ cs_HMap cs_hm_init(u8 element_size)
     result.data_cap = 16;
     result.data_used = 0;
     result.data = malloc(result.element_size * result.data_cap);
+    if (result.data == null) {
+        log_fatal("OUT OF MEMORY");
+        exit(-1);
+    }
     cs_HMap_bucket* buck = result.data;
     for (int i = 0; i < result.data_cap; i++) {
         buck->psl = 255;

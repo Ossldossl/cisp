@@ -11,6 +11,8 @@
 
 #define check_ssavar(var) if (ssa_eq(var, ssavar_invalid)) return ssavar_invalid;
 
+#define or_return(var, return_val) if ((var) == 0) return (return_val);
+
 /* ==== MAIN ==== */
 typedef struct cs_BasicBlock cs_BasicBlock;
 typedef struct cs_BasicBlockNode cs_BasicBlockNode;
@@ -18,9 +20,10 @@ typedef struct cs_Context cs_Context;
 typedef struct cs_Object cs_Object;
 typedef struct cs_Function cs_Function;
 typedef struct cs_FunctionBody cs_FunctionBody;
-typedef struct cs_Scope cs_Scope;
+typedef struct cs_Local cs_Local;
 typedef struct cs_ComScope cs_ComScope;
 typedef struct cs_SSAVar cs_SSAVar;
+typedef struct cs_SSADef cs_SSADef;
 typedef struct cs_SSAIns cs_SSAIns;
 typedef struct cs_SSAPhi cs_SSAPhi;
 typedef struct cs_Code cs_Code;
@@ -49,6 +52,7 @@ enum cs_Error {
     CS_SYMBOL_NOT_FOUND,
     CS_INVALID_NUMBER_OF_ARGUMENTS,
     CS_TOO_MANY_ARGUMENTS,
+    CS_WRONG_ARGUMENT_TYPE,
 
     CS_RUNTIME_ERRORS_START,
     CS_OUT_OF_MEM,
@@ -57,12 +61,18 @@ enum cs_Error {
 }; 
 
 enum cs_ObjectType {
+    _CS_INVALID,
+    _CS_CALL,
+    _CS_RETURN,
+    
+    // types
     CS_ATOM_INT,
     CS_ATOM_FLOAT,
     CS_ATOM_STR, // strings are immutable
     CS_ATOM_TRUE,
     CS_ATOM_FALSE,
     CS_ATOM_NIL,
+    CS_ATOM_VAR, // nothing
 
     // symbol is associated with a value while keyword is not
     CS_ATOM_SYMBOL,
@@ -70,6 +80,7 @@ enum cs_ObjectType {
 
     CS_LIST,
     CS_FUNC,    //cdr ^= cs_Function*
+    CS_ANON_FUNC,
     CS_CFUNC,   // cdr ^= cs_Function*
 
     // used only for bytecode
@@ -124,6 +135,7 @@ struct cs_Context {
     u32 cur_bb_id;
 
     cs_Arena comscopes;
+    cs_HMap ssa_defs; // ssa_var => (u32 bb_index, u32 instr_index)
     cs_ComScope* cur_scope;
     cs_BasicBlock* cur_bb;
 
@@ -152,6 +164,7 @@ u16 cs_obj_gettype(cs_Object *obj);
     X(CS_ADDF) \
     X(CS_ADDVF) \
     X(CS_ADDS) \
+    X(CS_ADDVS) \
     X(CS_SUBI) \
     X(CS_SUBV) \
     X(CS_SUBVI) \
@@ -245,13 +258,25 @@ const char* cs_OpKindStrings[] = {
 };
 #endif
 
-#define ssavar(h, v) (cs_SSAVar) {.hash=h, .version=v}
-#define ssa_new_temp() ssavar(tempvar_hash, c->cur_temp_id++)
-#define ssa_eq(a, b) ((a.hash == b.hash) && (a.version == b.version))
+struct cs_Local {
+    u16 type;
+    u16 version;
+};
+
+#define ssavar(h, t, v) (cs_SSAVar) {.hash=h, .type=t, .version=v}
+#define ssa_eq(a, b) ((a.hash == b.hash) && (a.version == b.version) && (a.type == b.type))
 #define ssa_invalid(s) (ssa_eq(s, ssavar_invalid))
+
+inline cs_SSAVar ssa_new_temp(cs_Context* c, cs_ObjectType type);
+
 struct cs_SSAVar {
     u32 hash;
-    u32 version;
+    struct cs_Local;
+};
+
+struct cs_SSADef {
+    i32 bb_id; // if bb_id is negative, then |bb_id+1| is the bb index, then instr_id is the index of the phi node, where the value is defined in
+    u32 instr_id;
 };
 
 struct cs_SSAIns {
@@ -290,8 +315,7 @@ struct cs_Function {
 };*/
 
 struct cs_ComScope {
-    cs_HMap locals; // map_of (cs_SSAVar)
-    cs_HMap functions; // map_of (u32 => (fn_id)) 
+    cs_HMap locals; // hash => cs_Local
 };
 
 struct cs_SSAPhi {
