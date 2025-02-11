@@ -1,2 +1,5 @@
-# cisp
-A lisp in C
+# Cisp
+
+Compiles LISP to SSA to allow for optimizations.
+
+Currently work in Progress.
